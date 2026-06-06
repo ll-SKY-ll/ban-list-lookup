@@ -1,0 +1,1 @@
+this is a mau-bot that can lookup bans from any policy list it is in and it also has a webinterface at `https://your-mau-bot/_matrix/maubot/plugin/<plugin_id>/

@@ -1,0 +1,14 @@
+maubot: 0.1.0
+id: net.codestorm.banlookup
+version: 1.2.0
+license: MIT
+modules:
+  - banlookup
+main_class: BanLookupBot
+extra_files:
+  - base-config.yaml
+  - web/index.html
+database: false
+config: true
+webapp: true
+dependencies: []

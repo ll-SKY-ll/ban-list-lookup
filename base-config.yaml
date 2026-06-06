@@ -1,0 +1,57 @@
+# Command prefix (without the leading "!")
+command_prefix: cs-ll
+
+# Whether the bot reacts in rooms or only via web. Usually true.
+respond_in_rooms: true
+
+# Whether to expose the moderator (event sender) who issued the ban.
+# Shown both in-room and on the public web page.
+show_sender: true
+
+# Max number of matching lists to render in a single in-room reply
+# before collapsing the rest into a count. Web page shows all.
+max_inline_matches: 25
+
+# Per-user rate limit for in-room commands (sliding window).
+# A user may issue at most `rate_limit_count` commands per
+# `rate_limit_window` seconds. Set rate_limit_count to 0 to disable.
+# Does not affect the web page.
+rate_limit_count: 5
+rate_limit_window: 60
+
+# Optional list of MXIDs exempt from the rate limit (e.g. your own
+# account and co-moderators).
+rate_limit_exempt: []
+  # - "@admin:example.org"
+
+# MXIDs allowed to run admin commands (e.g. reindex). If empty, falls
+# back to rate_limit_exempt.
+admins: []
+  # - "@admin:example.org"
+
+# Brand word shown before "list lookup" in the web page title/heading,
+# the in-room help message, and the no-match/match output. Set this to
+# rebrand the bot for your community. Defaults to "codestorm" if empty.
+web_brand: codestorm
+
+# Optional: human-readable labels for rooms, used as a fallback when a
+# room has no name. Keyed by room ID.
+# Example:
+#   room_labels:
+#     "!somePolicyRoom:matrix.org": "cme"
+room_labels: {}
+
+# Hardcoded contact info per policy room.
+# Keyed by the room ID the policy list lives in.
+# NOTE: keep this as the LAST key in the file. When populated, this map
+# disturbs comment handling for whatever key follows it during maubot's
+# config round-trip, causing that key's comment block to duplicate on
+# every save. Leaving it last means nothing follows it to be affected.
+# Example:
+#   contacts:
+#     "!somePolicyRoom:matrix.org":
+#       label: "community-moderation-effort"
+#       methods:
+#         - "abuse@example.org"
+#         - "#cme-appeals:matrix.org"
+contacts: {}

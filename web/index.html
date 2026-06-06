@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__BRAND__ list lookup</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A//www.w3.org/2000/svg%22%20viewBox%3D%220%200%2032%2032%22%3E%20%3Cdefs%3E%3ClinearGradient%20id%3D%22b%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%20%3Cstop%20offset%3D%220%25%22%20stop-color%3D%22%23f291bc%22/%3E%20%3Cstop%20offset%3D%2235%25%22%20stop-color%3D%22%23ef83b3%22/%3E%20%3Cstop%20offset%3D%2250%25%22%20stop-color%3D%22%239a7ec0%22/%3E%20%3Cstop%20offset%3D%2265%25%22%20stop-color%3D%22%237e88d6%22/%3E%20%3Cstop%20offset%3D%22100%25%22%20stop-color%3D%22%237aa6ec%22/%3E%20%3C/linearGradient%3E%3C/defs%3E%20%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%227%22%20fill%3D%22url%28%23b%29%22/%3E%20%3C/svg%3E">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    background: #fff;
+    color: #202124;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #202124; color: #e8eaed; }
+    .box { border-color: #5f6368; background: #303134; }
+    .box input { background: transparent; color: #e8eaed; }
+    .match { background: #303134; border-color: #5f6368; }
+    details summary { color: #8ab4f8; }
+  }
+  .home {
+    margin-top: 22vh;
+    width: 100%;
+    max-width: 580px;
+    padding: 0 16px;
+    transition: margin-top .25s ease;
+  }
+  .home.compact { margin-top: 4vh; }
+  h1 {
+    text-align: center;
+    font-weight: 400;
+    font-size: 2.4rem;
+    letter-spacing: -.5px;
+    margin: 0 0 24px;
+  }
+  h1 .accent { color: #1a73e8; }
+  .box {
+    display: flex;
+    border: 1px solid #dfe1e5;
+    border-radius: 24px;
+    overflow: hidden;
+    background: #fff;
+    transform: translateZ(0);
+  }
+  .box:focus-within { box-shadow: 0 1px 6px rgba(32,33,36,.28); border-color: rgba(223,225,229,0); }
+  .box input {
+    flex: 1;
+    padding: 12px 18px;
+    font-size: 1rem;
+    border: none;
+    border-radius: 0;
+    outline: none;
+    background: transparent;
+    color: #202124;
+  }
+  .box input::placeholder { color: #80868b; opacity: 1; }
+  .box button {
+    padding: 0 24px;
+    font-size: .9rem;
+    border: none;
+    border-radius: 0;
+    background: #1a73e8;
+    color: #fff;
+    cursor: pointer;
+  }
+  .box button:hover { background: #1765cc; }
+  #results { width: 100%; max-width: 720px; padding: 24px 16px 64px; }
+  .status { text-align: center; color: #5f6368; margin: 24px 0; }
+  .match {
+    border: 1px solid #dfe1e5;
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 14px;
+  }
+  .match .label { font-weight: 600; font-size: 1.05rem; }
+  .match .rid { font-family: monospace; font-size: .8rem; color: #5f6368; }
+  .match ul { margin: 8px 0; padding-left: 18px; }
+  .match code { font-family: monospace; }
+  .contact { color: #1a73e8; }
+  details summary { cursor: pointer; color: #1a73e8; margin-top: 6px; }
+  details p { white-space: pre-wrap; margin: 6px 0 0; }
+</style>
+</head>
+<body>
+  <div class="home" id="home">
+    <h1>__BRAND__ <span class="accent">list lookup</span></h1>
+    <div class="box">
+      <input id="entity" type="text" autocomplete="off" spellcheck="false"
+             placeholder="@user:server.tld  ·  server.tld  ·  !room:server.tld"
+             maxlength="255">
+      <button id="go">Check</button>
+    </div>
+  </div>
+  <div id="results"></div>
+
+<script>
+(function () {
+  const input = document.getElementById("entity");
+  const btn = document.getElementById("go");
+  const home = document.getElementById("home");
+  const results = document.getElementById("results");
+
+  // client-side mirror of the server sanitizer; server is authoritative
+  const VALID = /^[A-Za-z0-9_.:@#!*?/+=-]{1,255}$/;
+  const esc = (s) => s.replace(/[&<>"']/g, c => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  function fmtDate(ts) {
+    if (!ts) return "?";
+    return new Date(ts).toISOString().slice(0, 10);
+  }
+
+  function render(data) {
+    if (!data.matches.length) {
+      results.innerHTML =
+        '<div class="status"><code>' + esc(data.entity) +
+        '</code> is not listed on any list. ✅</div>';
+      return;
+    }
+    let html = '<div class="status">' + esc(data.entity) + ' matched on ' +
+      data.count + ' list' + (data.count !== 1 ? 's' : '') + '</div>';
+    for (const m of data.matches) {
+      html += '<div class="match">';
+      html += '<div class="label">📋 ' + esc(m.label) +
+              ' <span class="rid">' + esc(m.room_id) + '</span></div>';
+      html += '<ul>';
+      html += '<li>entity: <code>' + esc(m.entity) + '</code> (' + esc(m.rule_type) + ')</li>';
+      html += '<li>recommendation: <code>' + esc(m.recommendation) + '</code></li>';
+      html += '<li>reason: ' + (m.reason ? esc(m.reason) : '<i>none given</i>') + '</li>';
+      if (m.sender) html += '<li>issued by: <code>' + esc(m.sender) + '</code></li>';
+      html += '<li>' + fmtDate(m.origin_ts) + '</li>';
+      if (m.contacts && m.contacts.length)
+        html += '<li class="contact">📞 contact: ' +
+                m.contacts.map(esc).join(' / ') + '</li>';
+      html += '</ul>';
+      const topic = m.room_topic ? esc(m.room_topic) : '<i>no topic</i>';
+      html += '<details><summary>room topic</summary><p>' + topic + '</p></details>';
+      html += '</div>';
+    }
+    results.innerHTML = html;
+  }
+
+  async function search() {
+    const entity = input.value.trim();
+    if (!entity) return;
+    if (!VALID.test(entity)) {
+      home.classList.add("compact");
+      results.innerHTML = '<div class="status">invalid entity format.</div>';
+      return;
+    }
+    home.classList.add("compact");
+    results.innerHTML = '<div class="status">searching…</div>';
+    try {
+      const r = await fetch("api/lookup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entity })
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        results.innerHTML = '<div class="status">' +
+          esc(data.error || "error") + '</div>';
+        return;
+      }
+      render(data);
+    } catch (e) {
+      results.innerHTML = '<div class="status">request failed.</div>';
+    }
+  }
+
+  btn.addEventListener("click", search);
+  input.addEventListener("keydown", e => { if (e.key === "Enter") search(); });
+  input.focus();
+})();
+</script>
+</body>
+</html>
