@@ -136,9 +136,21 @@
       html += '<li>reason: ' + (m.reason ? esc(m.reason) : '<i>none given</i>') + '</li>';
       if (m.sender) html += '<li>issued by: <code>' + esc(m.sender) + '</code></li>';
       html += '<li>' + fmtDate(m.origin_ts) + '</li>';
-      if (m.contacts && m.contacts.length)
-        html += '<li class="contact">📞 contact: ' +
-                m.contacts.map(esc).join(' / ') + '</li>';
+      if (m.contacts && m.contacts.length) {
+        const shown = m.contacts.slice(0, 2);
+        const rest = m.contacts.slice(2);
+        html += '<li class="contact">📞 contact' +
+                (m.contact_from_config ? ' (configured)' : '') + ': ' +
+                shown.map(esc).join(' / ') + '</li>';
+        if (rest.length)
+          html += '<li class="contact"><details><summary>+' + rest.length +
+                  ' more contact' + (rest.length !== 1 ? 's' : '') + '</summary>' +
+                  rest.map(esc).join('<br>') + '</details></li>';
+      }
+      if (m.support_page)
+        html += '<li class="contact">🔗 support page: <a href="' +
+                esc(m.support_page) + '" rel="noopener noreferrer nofollow">' +
+                esc(m.support_page) + '</a></li>';
       html += '</ul>';
       const topic = m.room_topic ? esc(m.room_topic) : '<i>no topic</i>';
       html += '<details><summary>room topic</summary><p>' + topic + '</p></details>';

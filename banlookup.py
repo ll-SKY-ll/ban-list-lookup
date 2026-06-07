@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import html
+import json
 import os
 import re
 import sqlite3
@@ -34,6 +35,42 @@ RULE_TYPES: dict[EventType, str] = {
 for _t, _kind in LEGACY:
     RULE_TYPES[_t] = _kind
 
+# MSC4489 per-room contact event. Stable type takes precedence over unstable
+# when both are present in a room's state.
+CONTACT_UNSTABLE = EventType.find("net.codestorm.msc4489.contact",
+                                  t_class=EventType.Class.STATE)
+CONTACT_STABLE = EventType.find("m.room.contact", t_class=EventType.Class.STATE)
+CONTACT_TYPES = (CONTACT_STABLE, CONTACT_UNSTABLE)  # preference order
+
+ADMIN_ROLE = "m.role.admin"
+
+# Human-readable labels for known m.role.* values (MSC1929 set + m.role.appeals).
+# The set is open: unrecognised roles fall back to a cleaned-up tail of the id,
+# and roles with no value render with no label at all (per MSC4489 client rules).
+ROLE_LABELS = {
+    "m.role.admin": "admin",
+    "m.role.security": "security",
+    "m.role.appeals": "appeals",
+}
+
+
+def _role_label(role: str) -> str:
+    """Short display label for an m.role.* value, or '' if no role given.
+
+    Recognised roles map to a friendly word; unknown but well-formed m.role.*
+    values degrade to their last dotted segment so new roles still show
+    something sensible without a code change."""
+    if not role:
+        return ""
+    if role in ROLE_LABELS:
+        return ROLE_LABELS[role]
+    tail = role.rsplit(".", 1)[-1] if role.startswith("m.role.") else role
+    return tail or ""
+
+
+# How many contacts to show before collapsing the rest into a <details>.
+CONTACT_INLINE_LIMIT = 2
+
 _VALID_ENTITY = re.compile(r"^[A-Za-z0-9_.:@#!*?/+=-]{1,255}$")
 
 
@@ -50,6 +87,8 @@ class Match:
     sender: str
     origin_ts: int
     contacts: list[str] = field(default_factory=list)
+    support_page: str = ""
+    contact_from_config: bool = False
 
 
 def classify(entity: str) -> str:
@@ -68,6 +107,7 @@ class Config(BaseProxyConfig):
     def do_update(self, helper: ConfigUpdateHelper) -> None:
         helper.copy("command_prefix")
         helper.copy("respond_in_rooms")
+        helper.copy("web_brand")
         helper.copy("show_sender")
         helper.copy("max_inline_matches")
         helper.copy("rate_limit_count")
@@ -76,7 +116,6 @@ class Config(BaseProxyConfig):
         helper.copy("admins")
         helper.copy("contacts")
         helper.copy("room_labels")
-        helper.copy("web_brand")
 
 
 class BanLookupBot(Plugin):
@@ -140,16 +179,18 @@ class BanLookupBot(Plugin):
             ON rules(entity_lower) WHERE kind='exact';
         CREATE INDEX IF NOT EXISTS idx_rules_kind ON rules(kind);
         CREATE TABLE IF NOT EXISTS room_meta (
-            room_id TEXT PRIMARY KEY,
-            name    TEXT,
-            topic   TEXT,
-            alias   TEXT
+            room_id      TEXT PRIMARY KEY,
+            name         TEXT,
+            topic        TEXT,
+            alias        TEXT,
+            contact_json TEXT
         );
         """)
-        # Idempotent migration for DBs created before the alias column existed.
+        # Idempotent migrations for DBs created before newer columns existed.
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(room_meta)")}
-        if "alias" not in cols:
-            self.db.execute("ALTER TABLE room_meta ADD COLUMN alias TEXT")
+        for col in ("alias", "contact_json"):
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE room_meta ADD COLUMN {col} TEXT")
         self.db.commit()
 
     def _load_regex_cache(self) -> None:
@@ -196,6 +237,8 @@ class BanLookupBot(Plugin):
         name, topic, alias = "", "", ""
         rows = []
         saw_alias_event = False
+        # Hold raw contact content per type so the stable type can win.
+        contact_content = {CONTACT_STABLE: None, CONTACT_UNSTABLE: None}
         for evt in state:
             if evt.type == EventType.ROOM_NAME:
                 name = self._cget(evt.content, "name", "")
@@ -205,10 +248,18 @@ class BanLookupBot(Plugin):
                 saw_alias_event = True
                 alias = self._cget(evt.content, "canonical_alias", "") \
                     or self._cget(evt.content, "alias", "")
+            elif evt.type == CONTACT_STABLE:
+                contact_content[CONTACT_STABLE] = evt.content
+            elif evt.type == CONTACT_UNSTABLE:
+                contact_content[CONTACT_UNSTABLE] = evt.content
             elif evt.type in RULE_TYPES:
                 row = self._rule_row(evt)
                 if row:
                     rows.append(row)
+        # Resolve contact: stable type wins over unstable. Store raw content
+        # as JSON so future rendering changes need no DB migration.
+        chosen = contact_content[CONTACT_STABLE] or contact_content[CONTACT_UNSTABLE]
+        contact_json = self._contact_to_json(chosen)
         if rows:
             self.db.executemany(
                 "INSERT OR REPLACE INTO rules "
@@ -216,12 +267,74 @@ class BanLookupBot(Plugin):
                 " recommendation, reason, sender, origin_ts) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
             self.db.execute(
-                "INSERT OR REPLACE INTO room_meta (room_id, name, topic, alias) "
-                "VALUES (?,?,?,?)", (room_id, name, topic, alias))
+                "INSERT OR REPLACE INTO room_meta "
+                "(room_id, name, topic, alias, contact_json) "
+                "VALUES (?,?,?,?,?)",
+                (room_id, name, topic, alias, contact_json))
             if not name:
                 self.log.debug(
                     f"{room_id}: name={name!r} alias={alias!r} "
                     f"(canonical_alias event seen: {saw_alias_event})")
+
+    def _contact_to_json(self, content) -> str | None:
+        """Serialize MSC4489 contact event content to a JSON string for storage.
+
+        Stores only the fields we care about (contacts list + support_page) in a
+        plain, render-agnostic shape so future display changes need no migration.
+        """
+        if content is None:
+            return None
+        support = self._cget(content, "support_page", "")
+        try:
+            raw_contacts = content["contacts"]
+        except (KeyError, TypeError):
+            raw_contacts = getattr(content, "contacts", None)
+        contacts = []
+        if raw_contacts:
+            for c in raw_contacts:
+                mxid = self._cget(c, "matrix_id", "")
+                email = self._cget(c, "email_address", "")
+                if not mxid and not email:
+                    continue  # MUST be ignored per MSC
+                contacts.append({
+                    "matrix_id": mxid,
+                    "email_address": email,
+                    "role": self._cget(c, "role", ""),
+                })
+        if not contacts and not support:
+            return None
+        return json.dumps({"contacts": contacts, "support_page": support})
+
+    def _resolve_contacts(self, contact_json: str | None) -> tuple[list[str], str]:
+        """At query time, turn stored contact JSON into an ordered list of contact
+        strings plus a support page. Admin-role contacts come first, then others.
+        Each contact renders as '[role] matrix_id (email)', with the role label
+        omitted when the contact carries no role so the user can see who fields
+        what (e.g. appeals vs security) and choose accordingly.
+        """
+        if not contact_json:
+            return [], ""
+        try:
+            data = json.loads(contact_json)
+        except (ValueError, TypeError):
+            return [], ""
+        support = data.get("support_page", "") or ""
+        contacts = data.get("contacts", []) or []
+        admins, others = [], []
+        for c in contacts:
+            mxid = c.get("matrix_id", "")
+            email = c.get("email_address", "")
+            if not mxid and not email:
+                continue
+            if mxid and email:
+                target = f"{mxid} ({email})"
+            else:
+                target = mxid or email
+            role = c.get("role", "")
+            rlabel = _role_label(role)
+            label = f"[{rlabel}] {target}" if rlabel else target
+            (admins if role == ADMIN_ROLE else others).append(label)
+        return admins + others, support
 
     def _rule_row(self, evt: StateEvent):
         entity = self._cget(evt.content, "entity", "")
@@ -293,6 +406,29 @@ class BanLookupBot(Plugin):
         if membership in ("leave", "ban"):
             self._forget_room(str(evt.room_id))
 
+    @event.on(CONTACT_STABLE)
+    @event.on(CONTACT_UNSTABLE)
+    async def _on_contact(self, evt: StateEvent) -> None:
+        room_id = str(evt.room_id)
+        if not self.db.execute("SELECT 1 FROM room_meta WHERE room_id=?",
+                              (room_id,)).fetchone():
+            return  # not a policy room we're tracking
+        # Re-resolve from current state so stable keeps precedence over unstable
+        # regardless of which one just changed.
+        chosen = None
+        for etype in CONTACT_TYPES:  # stable first
+            try:
+                content = await self.client.get_state_event(room_id, etype, "")
+            except Exception:
+                content = None
+            if content:
+                chosen = content
+                break
+        self.db.execute(
+            "UPDATE room_meta SET contact_json=? WHERE room_id=?",
+            (self._contact_to_json(chosen), room_id))
+        self.db.commit()
+
     def _forget_room(self, room_id: str) -> None:
         """Drop all rules and metadata for a room we're no longer in."""
         had = self.db.execute("SELECT 1 FROM room_meta WHERE room_id=?",
@@ -330,19 +466,33 @@ class BanLookupBot(Plugin):
             return alias
         return room_id
 
-    def _contacts_for(self, room_id: str) -> list[str]:
-        contacts = self.config["contacts"] or {}
-        entry = contacts.get(room_id)
-        return list(entry.get("methods", [])) if entry else []
+    def _contact_info(self, room_id: str) -> tuple[list[str], str, bool]:
+        """Resolve (contact_methods, support_page, from_config) for a room.
+
+        Config `contacts` takes priority (operator's deliberate choice). If no
+        config entry exists, fall back to the room's MSC4489 contact event data.
+        """
+        cfg = self.config["contacts"] or {}
+        entry = cfg.get(room_id)
+        if entry and entry.get("methods"):
+            return list(entry["methods"]), entry.get("support_page", "") or "", True
+        row = self.db.execute(
+            "SELECT contact_json FROM room_meta WHERE room_id=?", (room_id,)).fetchone()
+        if not row:
+            return [], "", False
+        methods, support = self._resolve_contacts(row["contact_json"])
+        return methods, support, False
 
     def _row_to_match(self, row) -> Match:
         name, topic = self._meta(row["room_id"])
+        methods, support, from_cfg = self._contact_info(row["room_id"])
         return Match(
             room_id=row["room_id"], room_name=name, room_topic=topic,
             label=self._label_for(row["room_id"]), rule_type=row["rule_type"],
             entity=row["entity"], recommendation=row["recommendation"] or "",
             reason=row["reason"] or "", sender=row["sender"] or "",
-            origin_ts=row["origin_ts"] or 0, contacts=self._contacts_for(row["room_id"]),
+            origin_ts=row["origin_ts"] or 0,
+            contacts=methods, support_page=support, contact_from_config=from_cfg,
         )
 
     def lookup(self, entity: str) -> list[Match]:
@@ -565,8 +715,19 @@ class BanLookupBot(Plugin):
             lines.append(f"&nbsp;&nbsp;\u2022 issued by: <code>{html.escape(m.sender)}</code><br>")
         lines.append(f"&nbsp;&nbsp;\u2022 {ts}<br>")
         if m.contacts:
-            joined = " / ".join(html.escape(c) for c in m.contacts)
-            lines.append(f"&nbsp;&nbsp;\U0001F4DE contact: {joined}<br>")
+            src = " (configured)" if m.contact_from_config else ""
+            shown = m.contacts[:CONTACT_INLINE_LIMIT]
+            rest = m.contacts[CONTACT_INLINE_LIMIT:]
+            joined = " / ".join(html.escape(c) for c in shown)
+            lines.append(f"&nbsp;&nbsp;\U0001F4DE contact{src}: {joined}<br>")
+            if rest:
+                more = "<br>".join(html.escape(c) for c in rest)
+                lines.append(
+                    f"<details><summary>+{len(rest)} more contact"
+                    f"{'s' if len(rest) != 1 else ''}</summary>{more}</details>")
+        if m.support_page:
+            sp = html.escape(m.support_page)
+            lines.append(f"&nbsp;&nbsp;\U0001F517 support page: {sp}<br>")
         topic = html.escape(m.room_topic) if m.room_topic else "<i>no topic</i>"
         lines.append(f"<details><summary>room topic</summary>{topic}</details><br>")
         return "".join(lines)
@@ -598,6 +759,8 @@ class BanLookupBot(Plugin):
                 "rule_type": m.rule_type, "recommendation": m.recommendation,
                 "reason": m.reason, "origin_ts": m.origin_ts,
                 "room_topic": m.room_topic, "contacts": m.contacts,
+                "support_page": m.support_page,
+                "contact_from_config": m.contact_from_config,
             }
             if show_sender:
                 item["sender"] = m.sender
